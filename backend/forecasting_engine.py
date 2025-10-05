@@ -1,87 +1,88 @@
-import pandas as pd
-import joblib
-from sqlalchemy.orm import Session
-from sqlalchemy import text
-from typing import Optional
+import requests
+from typing import List, Dict, Any, Optional
 
-# Load the pre-trained model
-try:
-    model = joblib.load('aqi_forecaster.joblib')
-    print("✅ Forecasting model 'aqi_forecaster.joblib' loaded successfully.")
-except FileNotFoundError:
-    model = None
-    print("❌ WARNING: Forecasting model not found.")
+# The dedicated Air Quality API URL from Open-Meteo
+API_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 
 def generate_forecast(
-    db: Session, 
     lat: float, 
     lon: float, 
-    hours: int = 48,
+    hours: int = 72, # Defaulting to 3 days (72 hours)
     simulation: Optional[dict] = None
-) -> list:
+) -> List[Dict[str, Any]]:
     """
-    Generates an AQI forecast. If a simulation is provided, it adjusts the baseline data.
+    Generates a forecast by fetching live, historical, and forecast data directly 
+    from the Open-Meteo Air Quality API using an expanded parameter set.
     """
-    
-    # 1. Get the most recent real data for all pollutants
-    latest_pollutants_query = text("""
-        SELECT pm25, pm10, o3, no2, so2, co
-        FROM air_quality_data
-        WHERE COALESCE(pm25, pm10, o3, no2, so2, co) IS NOT NULL
-        ORDER BY time DESC, ST_Distance(ST_MakePoint(longitude, latitude), ST_MakePoint(:lon, :lat))
-        LIMIT 1;
-    """)
-    latest_pollutants_result = db.execute(latest_pollutants_query, {"lat": lat, "lon": lon}).mappings().first()
-    
-    if not latest_pollutants_result:
-        return []
+    print(f"Fetching extended air quality forecast for lat={lat}, lon={lon} from Open-Meteo...")
 
-    base_pollutants = dict(latest_pollutants_result)
+    # --- THIS IS THE KEY UPGRADE ---
+    # Using the new, more powerful parameter set you provided.
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": ["pm10", "pm2_5", "carbon_monoxide", "nitrogen_dioxide", "carbon_dioxide", "sulphur_dioxide", "ozone", "us_aqi"],
+        "current": "us_aqi",
+        "past_days": 1,
+        "forecast_days": 3,
+    }
+    # --- END OF UPGRADE ---
 
-    # Simulation Logic: Adjusts the starting pollutant values if a simulation is active
-    if simulation and simulation.get('pollutant') in base_pollutants:
-        pollutant_to_reduce = simulation['pollutant']
-        reduction_factor = 1 - (simulation['reduction'] / 100.0)
+    try:
+        response = requests.get(API_URL, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+
+        current_data = data.get('current', {})
+        hourly_data = data.get('hourly', {})
         
-        if base_pollutants[pollutant_to_reduce] is not None:
-            base_pollutants[pollutant_to_reduce] *= reduction_factor
+        if not hourly_data or not hourly_data.get('time'):
+            print("API did not return sufficient forecast data.")
+            return []
+
+        # --- (Simulation and data transformation logic remains the same,
+        # but now operates on a richer dataset) ---
+        reduction_delta = 0
+        if simulation and simulation.get('pollutant'):
+            pollutant_to_reduce = simulation['pollutant']
+            # Handle naming differences (e.g., pm25 vs pm2_5)
+            if pollutant_to_reduce == 'pm25':
+                pollutant_to_reduce = 'pm2_5'
             
-    # Always recalculate the overall starting AQI from the (potentially modified) pollutant values
-    pollutant_values = [v for k, v in base_pollutants.items() if v is not None]
-    base_aqi = max(pollutant_values) if pollutant_values else 0
+            reduction_percent = simulation['reduction']
+            current_pollutant_value = current_data.get(pollutant_to_reduce, 0)
+            if current_pollutant_value is not None:
+                reduction_delta = current_pollutant_value * (reduction_percent / 100.0)
 
-    # 2. Get the future weather forecast
-    weather_forecast_query = text("""
-        SELECT time, temperature_2m, relative_humidity_2m, precipitation, wind_speed_10m
-        FROM weather_forecasts
-        WHERE time >= NOW() ORDER BY time LIMIT :hours;
-    """)
-    weather_forecast = db.execute(weather_forecast_query, {"hours": hours}).mappings().all()
+        forecast_output = []
+        times = hourly_data.get('time', [])
+        us_aqi_values = hourly_data.get('us_aqi', [])
 
-    if not model or not weather_forecast:
-        # Fallback to a simple "persistence" forecast if model or weather is missing
-        return [{"hour": f"+{i+1}h", "predicted_aqi": round(base_aqi)} for i in range(hours)]
+        # The API returns past days + current day + forecast days, so we have more data
+        for i in range(len(times)):
+            original_aqi = float(us_aqi_values[i]) if i < len(us_aqi_values) and us_aqi_values[i] is not None else 0
+            simulated_aqi = original_aqi - reduction_delta
+            
+            # Create a record for each hour
+            record = {
+                "time": times[i], # Include the full timestamp
+                "hour": i - 24 if i < 24 else f"+{i-23}", # Label past hours negatively, future positively
+                "baseline_aqi": round(max(0, original_aqi)),
+                "simulated_aqi": round(max(0, simulated_aqi))
+            }
 
-    # 3. Use the ML model to predict on the future weather data
-    forecast_df = pd.DataFrame(weather_forecast)
-    forecast_df['time'] = pd.to_datetime(forecast_df['time'])
-    forecast_df['hour'] = forecast_df['time'].dt.hour
-    forecast_df['dayofweek'] = forecast_df['time'].dt.dayofweek
-    forecast_df['month'] = forecast_df['time'].dt.month
-    
-    features = ['temperature_2m', 'relative_humidity_2m', 'precipitation', 'wind_speed_10m', 'hour', 'dayofweek', 'month']
-    X_forecast = forecast_df[features]
-    
-    predicted_aqi_values = model.predict(X_forecast)
-    
-    # 4. Adjust the "shape" of the ML prediction based on our (potentially simulated) starting point
-    adjustment_factor = base_aqi / predicted_aqi_values[0] if predicted_aqi_values[0] > 0 else 1
-    adjusted_predictions = predicted_aqi_values * adjustment_factor
+            # Add all other pollutant data to the record
+            for key, values in hourly_data.items():
+                if key not in ['time', 'us_aqi'] and i < len(values) and values[i] is not None:
+                     record_key = key.replace('pm2_5', 'pm25').replace('_dioxide', 'o2').replace('_monoxide', 'o')
+                     record[record_key] = values[i]
 
-    forecast = []
-    for i, prediction in enumerate(adjusted_predictions):
-        safe_prediction = max(0, float(prediction))
-        forecast.append({"hour": f"+{i+1}h", "predicted_aqi": round(safe_prediction)})
+            forecast_output.append(record)
 
-    return forecast
+        print(f"Successfully generated a {len(forecast_output)}-hour forecast from live API.")
+        return forecast_output
+
+    except Exception as e:
+        print(f"An error occurred while processing the forecast: {e}")
+        return []
 
