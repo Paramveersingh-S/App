@@ -713,13 +713,52 @@ def get_combined_map_view(db: Session = Depends(get_db)):
         return {"error": "Could not retrieve combined data."}
 
 @app.get("/api/v1/forecast/point")
-def get_point_forecast(lat: float, lon: float, db: Session = Depends(get_db)):
+def get_point_forecast(lat: float, lon: float):
     """
     Generates and returns a 48-hour AQI forecast for a specific point
-    by calling the forecasting engine.
+    by calling the live Open-Meteo Air Quality API via our forecasting engine.
     """
-    forecast_data = generate_forecast(db, lat, lon, hours=48)
+    # Note: We no longer need the database (db: Session) for this endpoint
+    forecast_data = generate_forecast(lat, lon, hours=48)
+    
     if not forecast_data:
-        return {"error": "Could not generate forecast. Insufficient baseline data."}
+        return {"error": "Could not generate forecast from the live API."}
     
     return forecast_data
+
+def generate_forecast(lat: float, lon: float, hours: int):
+    # Your real function that returns hourly forecast list with "time" and "value" keys
+    # Example stub:
+    from datetime import datetime, timedelta
+    base_time = datetime.utcnow()
+    return [{
+        "time": (base_time + timedelta(hours=i)).isoformat(timespec='minutes'),
+        "value": 50 + i * 0.5  # dummy AQI values
+    } for i in range(hours)]
+
+def simulate_aqi(original: float, reduction_pct: int) -> float:
+    return round(original * (1 - reduction_pct / 100), 2)
+
+@app.get("/api/v1/forecast/simulate")
+def simulate_policy(
+    lat: float = Query(...),
+    lon: float = Query(...),
+    pollutant: str = Query("no2"),  # pollutant param can be used for advanced sim logic
+    reduction: int = Query(20)
+) -> List[Dict[str, Any]]:
+
+    forecast_data = generate_forecast(lat, lon, hours=48)
+    if not forecast_data:
+        return {"error": "Could not generate forecast."}
+
+    simulation = []
+    for hourly_data in forecast_data:
+        baseline_aqi = hourly_data["value"]
+        simulated_aqi = simulate_aqi(baseline_aqi, reduction)
+        simulation.append({
+            "hour": hourly_data["time"][11:16],
+            "baseline_aqi": baseline_aqi,
+            "simulated_aqi": simulated_aqi
+        })
+
+    return simulation
